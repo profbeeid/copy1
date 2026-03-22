@@ -1,3 +1,5 @@
 {
+  "buildCommand": "echo \"window.__PROFBEE_KEY__='$OPENAI_API_KEY';window.__SUPABASE_URL__='$SUPABASE_URL';window.__SUPABASE_ANON_KEY__='$SUPABASE_ANON_KEY';window.__PROFBEE_MODEL__='';\" > secrets.js",
+  "outputDirectory": ".",
   "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
 }
