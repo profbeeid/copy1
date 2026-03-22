@@ -156,7 +156,7 @@ async function callAgent(agent: any, gen: any, openaiKey: string): Promise<any> 
     },
     body: JSON.stringify({
       model: agent.model,
-      max_tokens: 200,
+      max_completion_tokens: 200,
       temperature: 0.2,
       messages: [
         { role: 'system', content: agent.system_prompt },
