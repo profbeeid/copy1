@@ -158,7 +158,7 @@ async function callOpenAI(apiKey, model, systemPrompt, userBrief) {
     },
     body: JSON.stringify({
       model,
-      max_tokens: 1000,
+      max_completion_tokens: 1000,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userBrief }
