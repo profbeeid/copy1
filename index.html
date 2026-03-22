@@ -1,0 +1,1853 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Prof Bee Copywriting Agent</title>
+    <!-- secrets injected at build time -->
+    <script src="secrets.js"></script>
+    <script>
+      window.__PROFBEE_KEY__       = window.__PROFBEE_KEY__       || '';
+      window.__PROFBEE_MODEL__     = window.__PROFBEE_MODEL__      || '';
+      window.__SUPABASE_URL__      = window.__SUPABASE_URL__       || '';
+      window.__SUPABASE_ANON_KEY__ = window.__SUPABASE_ANON_KEY__  || '';
+    </script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@300;400;500;600&display=swap');
+      * { box-sizing: border-box; }
+      body { background: #1a1510; color: #f0ebe3; font-family: 'Inter', sans-serif; margin: 0; min-height: 100vh; }
+      .mono { font-family: 'JetBrains Mono', monospace; }
+      ::-webkit-scrollbar { width: 6px; }
+      ::-webkit-scrollbar-track { background: #2a2018; }
+      ::-webkit-scrollbar-thumb { background: #c8860a55; }
+      ::-webkit-scrollbar-thumb:hover { background: #c8860a; }
+      .brand-profbee.active { background: #1e2a1e; border-color: #6aaa6a !important; color: #6aaa6a; }
+      .brand-wnr.active { background: #1e1a2a; border-color: #8a7aaa !important; color: #c8bce8; }
+      .brand-nctr.active { background: #2a1e10; border-color: #c8860a !important; color: #e8a030; }
+      textarea { resize: vertical; }
+      textarea:focus, input:focus { outline: none; }
+      @keyframes slideDown { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
+      .slide-in { animation: slideDown 0.2s ease-out; }
+      @keyframes fadeOut { 0% { opacity: 1; } 70% { opacity: 1; } 100% { opacity: 0; } }
+      .fade-badge { animation: fadeOut 3s forwards; }
+      .rule-tag-correction { color: #c8860a; font-size: 0.65rem; }
+      .rule-tag-manual { color: #6aaa6a; font-size: 0.65rem; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+const { useState, useEffect, useCallback, useContext, createContext, useRef } = React;
+
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
+const CONFIG = {
+  apiKey:      () => window.__PROFBEE_KEY__ || '',
+  apiUrl:      'https://api.openai.com/v1/chat/completions',
+  model:       window.__PROFBEE_MODEL__ || 'gpt-5.4-nano',
+  maxTokens:   1000,
+  temperature: 0.9,
+  reasoningEffort: 'medium',
+  exemplarsInjectedPerCall:      3,
+  antiExemplarsInjectedPerCall:  2,
+  exemplarThreshold:             4.0,
+  antiExemplarThreshold:         2.0,
+  singleDimensionExemplarScore:  5,
+};
+
+// ─── Supabase client ──────────────────────────────────────────────────────────
+const supabase = window.supabase.createClient(
+  window.__SUPABASE_URL__ || '',
+  window.__SUPABASE_ANON_KEY__ || ''
+);
+
+// ─── Async kv_store adapter (rules, version log) ──────────────────────────────
+const storage = {
+  get: async (key) => {
+    const { data } = await supabase.from('kv_store').select('value').eq('key', key).single();
+    return data ? JSON.parse(data.value) : null;
+  },
+  set: async (key, value) => {
+    await supabase.from('kv_store').upsert({ key, value: JSON.stringify(value) });
+  },
+};
+
+// ─── Anonymous user helpers ───────────────────────────────────────────────────
+async function getOrCreateUser() {
+  let userId = localStorage.getItem('profbee_user_id');
+  if (userId) return userId;
+  const nickname = 'guest_' + Math.random().toString(36).slice(2, 7);
+  const { data } = await supabase.from('users')
+    .insert({ nickname, role: 'anonymous', vote_weight: 0.5 })
+    .select('id').single();
+  if (data && data.id) {
+    localStorage.setItem('profbee_user_id', data.id);
+    return data.id;
+  }
+  const fallback = 'local_' + Math.random().toString(36).slice(2, 10);
+  localStorage.setItem('profbee_user_id', fallback);
+  return fallback;
+}
+
+async function getUserRole(userId) {
+  const { data } = await supabase.from('users').select('role').eq('id', userId).single();
+  return data?.role || 'anonymous';
+}
+
+// ─── Supabase exemplar queries ────────────────────────────────────────────────
+async function getTopExemplars(brand, task, focusDimension = null, limit = 3) {
+  const orderCol = focusDimension ? `score_${focusDimension}` : 'weighted_overall';
+  const { data } = await supabase.from('exemplars')
+    .select('id,brief,output,weighted_overall,score_hook,score_specificity,score_voice_fit,score_tension,score_originality,notes')
+    .eq('brand', brand).eq('task_type', task)
+    .order(orderCol, { ascending: false })
+    .limit(limit);
+  return data || [];
+}
+
+async function getTopAntiExemplars(brand, task, focusDimension = null, limit = 2) {
+  const orderCol = focusDimension ? `score_${focusDimension}` : 'weighted_overall';
+  const { data } = await supabase.from('anti_exemplars')
+    .select('id,brief,output,weighted_overall,worst_dimension,score_hook,score_specificity,score_voice_fit,score_tension,score_originality,why_bad')
+    .eq('brand', brand).eq('task_type', task)
+    .order(orderCol, { ascending: true })
+    .limit(limit);
+  return data || [];
+}
+
+// ─── Rules from Supabase ──────────────────────────────────────────────────────
+async function getAlwaysRules() {
+  const { data } = await supabase.from('rules').select('*').eq('scope','always').eq('active',true);
+  return data || [];
+}
+async function getTaskRules(task) {
+  const { data } = await supabase.from('rules').select('*').eq('scope','task').eq('task_type',task).eq('active',true);
+  return data || [];
+}
+
+// ─── Corrections from kv_store ────────────────────────────────────────────────
+async function getCorrections(brand, task) {
+  return (await storage.get(`corrections:${brand}:${task}`)) || [];
+}
+async function setCorrections(brand, task, arr) {
+  await storage.set(`corrections:${brand}:${task}`, arr);
+}
+async function getVersionLog() {
+  return (await storage.get('system_prompt:version_log')) || [];
+}
+async function setVersionLog(arr) {
+  await storage.set('system_prompt:version_log', arr);
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+const BRANDS = [
+  { id: 'profbee', label: 'Professor Bee', short: 'Prof Bee', sub: 'educator · trust' },
+  { id: 'wnr',     label: 'Walden & Rooz', short: 'WnR',      sub: 'craft · sensory' },
+  { id: 'nctr',    label: 'NCTR',          short: 'NCTR',      sub: 'everyday · scale' },
+];
+const TASKS = [
+  { id: 'ig_caption',     label: 'IG Caption' },
+  { id: 'tiktok_caption', label: 'TikTok Caption' },
+  { id: 'ad_copy',        label: 'Ad Copy' },
+  { id: 'video_script',   label: 'Video Script' },
+  { id: 'product_desc',   label: 'Product Desc' },
+  { id: 'email',          label: 'Email' },
+];
+const TL = Object.fromEntries(TASKS.map(t => [t.id, t.label]));
+const BL = Object.fromEntries(BRANDS.map(b => [b.id, b.label]));
+
+const DIMENSIONS = [
+  { id: 'hook',        label: 'Hook',        desc: 'Does line 1 stop the scroll?' },
+  { id: 'specificity', label: 'Specificity', desc: 'Concrete detail vs vague claim' },
+  { id: 'voice_fit',   label: 'Voice Fit',   desc: 'Unmistakably this brand, not another' },
+  { id: 'tension',     label: 'Tension',     desc: 'Creates a gap the reader needs to close' },
+  { id: 'originality', label: 'Originality', desc: 'Sounds human, not generic AI copy' },
+];
+
+// ─── Base system prompt ───────────────────────────────────────────────────────
+const BASE_PROMPT = `You are a copywriting agent for Prof Bee Holding, an Indonesian honey company operating three distinct brands. You write copy that is precise, specific, and commercially grounded. You never write generic health claims without support. You never blend brand voices. You do not use filler enthusiasm.
+
+---
+
+BRAND CONTEXT
+
+PROFESSOR BEE
+Role: Category educator and trust layer. Decodes honey for the urban educated class.
+Tone: Scientific, clear, confident without chest-thumping. Like a careful teacher, not an angry whistleblower. The word "decode" is central to this brand.
+Content jobs: category decoding, myth busting, sensory education, sourcing transparency, consumer literacy, industry reform framing.
+What to avoid: cheap promotional behavior, overselling, jargon overload, preachy tone.
+
+WALDEN & ROOZ (WnR)
+Role: Premium craft honey brand. Turns honey into a refined, sensory, giftable experience.
+Tone: Calm, assured, tasteful, reverent, quiet status. Like how someone talks about fine wine or single-origin coffee, not how they sell supplements.
+Content jobs: sensory storytelling (aroma, nectar source, color, mouthfeel, finish), provenance and place, batch individuality, ritual and use context, packaging as object, craft legitimacy.
+Hard constraints: NEVER blend voices with NCTR. NEVER make health claims without support. WnR honey is strictly single-origin, never blended. Do not imply otherwise.
+Variants: Acacia, Mango, Rambutan, Signature. Each has distinct flavor profile.
+Price range: 220,000-450,000 IDR per jar. Target: discerning Jakarta buyers, gifting.
+What to avoid: mass-market tone, discount energy, generic health cliches, loud CTAs.
+
+NCTR
+Role: Everyday mass-market honey platform. Useful, practical, scalable.
+Tone: Simple, energetic, useful. The buyer should think: "This fits my life."
+Content jobs: use-case education, problem-solution framing, before-after narratives, habit formation, family relevance, practical offers, social proof from everyday users.
+Channels: TikTok-first for content, marketplaces (Tokopedia/Shopee), affiliates.
+Price range: 110,000-140,000 IDR per jar.
+Segments: Active/runners, cooking/F&B, daily households, moms, youth.
+What to avoid: vague lofty language, over-aesthetic content, WnR tone.
+
+---
+
+BRAND DISTINCTION TEST
+If the copy could belong to any of the three brands, it has failed.
+Each piece of copy must be answerable: which brand customer question does this answer?
+- Professor Bee answers: "Can I trust what I am being told about honey?"
+- WnR answers: "What does excellent honey look and feel like?"
+- NCTR answers: "How does honey help me in real daily life?"
+
+---
+
+INDONESIAN MARKET GROUND TRUTH
+- Indonesian consumers do not gather organically. They require deliberate shepherding.
+- Cheap-feeling campaigns are ignored regardless of message quality.
+- Being "part of something" must feel costly and exclusive to be valued (WnR).
+- Generic health claims are tuned out. Specific sensory and use-case claims land.
+- The core WnR consumer insight: "aku baru tau madu ada rasanya" -- provocation-first, not education-first. Make people feel they have been missing something.
+
+---
+
+PLATFORM NOTES
+- WnR is IG-first. Copy should suit static image captions: atmosphere over urgency.
+- NCTR is TikTok-first. Copy should hook in the first line. Energy, not elegance.
+- IG captions and TikTok captions are different tasks. Do not write one as the other.
+
+---
+
+OUTPUT FORMAT
+Return only the requested copy. No preamble, no explanation, no meta-commentary.
+If you need to ask a clarifying question, ask it before writing, not after.
+Write in the language specified in the brief (default: Indonesian unless stated otherwise).`;
+
+// ─── Assemble system prompt (async) ──────────────────────────────────────────
+async function assemblePrompt(brand, task, focusDimension = null) {
+  let p = BASE_PROMPT;
+
+  const [ar, tr, ex, anti] = await Promise.all([
+    getAlwaysRules(),
+    getTaskRules(task),
+    getTopExemplars(brand, task, focusDimension, CONFIG.exemplarsInjectedPerCall),
+    getTopAntiExemplars(brand, task, focusDimension, CONFIG.antiExemplarsInjectedPerCall),
+  ]);
+
+  if (ar.length) { p += '\n\n---\n\nHARD RULES (always apply):\n'; ar.forEach(r => p += `- ${r.text}\n`); }
+  if (tr.length) { p += `\n\nRULES FOR THIS TASK TYPE (${TL[task]}):\n`; tr.forEach(r => p += `- ${r.text}\n`); }
+
+  if (ex.length) {
+    p += `\n\nEXEMPLARS FOR THIS BRAND + TASK (match this quality):\n`;
+    ex.forEach((e, i) => {
+      const scoreStr = e.weighted_overall != null ? `overall: ${parseFloat(e.weighted_overall).toFixed(1)}/5` : '';
+      p += `\nExemplar ${i+1} [${scoreStr}]:\nBrief: ${e.brief}\nOutput: ${e.output}\n`;
+    });
+  }
+
+  if (anti.length) {
+    p += `\n\nANTI-EXEMPLARS — DO NOT WRITE LIKE THIS:\nThese are real outputs rated as failures. Study what makes them weak.\nDo not replicate their patterns, structure, phrasing, or failure modes.\n`;
+    anti.forEach((e, i) => {
+      const worstStr = e.worst_dimension ? `, worst dimension: ${e.worst_dimension}` : '';
+      const whyStr = e.why_bad && e.why_bad.trim() ? e.why_bad : 'Rated low across multiple dimensions.';
+      p += `\nAnti-Exemplar ${i+1} [overall: ${e.weighted_overall != null ? parseFloat(e.weighted_overall).toFixed(1) : '?'}/5${worstStr}]:\nBrief: ${e.brief}\nOutput: ${e.output}\nWhy it failed: ${whyStr}\n`;
+    });
+  }
+
+  if (focusDimension) {
+    const dim = DIMENSIONS.find(d => d.id === focusDimension);
+    if (dim) {
+      p += `\n\nDIMENSION FOCUS — THIS GENERATION ONLY\nYour primary goal is to maximize: ${dim.label}\nDefinition: ${dim.desc}\n\nStudy these exemplars specifically for their ${dim.label} quality.\n\nAll other dimensions still matter. But if you must trade off, prioritize ${dim.label}.\nDo not mention this focus in your output. Just write.`;
+    }
+  }
+
+  return p;
+}
+
+// ─── OpenAI API call ──────────────────────────────────────────────────────────
+async function callOpenAI(systemPrompt, userBrief) {
+  const apiKey = CONFIG.apiKey();
+  if (!apiKey) throw new Error('API key not configured. See window.__PROFBEE_KEY__ in index.html.');
+  const body = {
+    model: CONFIG.model,
+    max_completion_tokens: CONFIG.maxTokens,
+    temperature: CONFIG.temperature,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userBrief }
+    ]
+  };
+  if (CONFIG.model.startsWith('o1') || CONFIG.model.startsWith('o3')) {
+    body.reasoning_effort = CONFIG.reasoningEffort;
+  }
+  const response = await fetch(CONFIG.apiUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err?.error?.message || `API error ${response.status}`);
+  }
+  const data = await response.json();
+  return data.choices[0].message.content;
+}
+
+const uuid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+// ─── App Context ──────────────────────────────────────────────────────────────
+const AppContext = createContext({
+  pickedBrief: null,
+  setPickedBrief: () => {},
+  currentUserId: null,
+  userRole: 'anonymous',
+  activeView: 'generate',
+  setActiveView: () => {},
+});
+
+// ─── Shared UI ────────────────────────────────────────────────────────────────
+function Btn({ onClick, children, variant='primary', className='', disabled=false, small=false }) {
+  const base = `font-medium transition-colors cursor-pointer border ${small ? 'px-3 py-1 text-xs' : 'px-4 py-2 text-sm'} ${disabled ? 'opacity-40 cursor-not-allowed' : ''}`;
+  const v = {
+    primary: 'bg-amber-700 border-amber-600 text-amber-50 hover:bg-amber-600',
+    ghost:   'bg-transparent border-stone-600 text-stone-300 hover:border-stone-400 hover:text-stone-100',
+    danger:  'bg-transparent border-red-800 text-red-400 hover:bg-red-900 hover:text-red-200',
+    amber:   'bg-transparent border-amber-700 text-amber-500 hover:bg-amber-900 hover:text-amber-300',
+    green:   'bg-transparent border-green-800 text-green-400 hover:bg-green-900 hover:text-green-200',
+  };
+  return <button onClick={disabled ? undefined : onClick} className={`${base} ${v[variant] || v.primary} ${className}`} disabled={disabled}>{children}</button>;
+}
+function Card({ children, className='' }) {
+  return <div className={`border border-stone-700 bg-stone-900 p-4 ${className}`}>{children}</div>;
+}
+function Lbl({ children }) {
+  return <label className="block text-xs font-medium text-stone-400 mb-1 uppercase tracking-wide">{children}</label>;
+}
+function TA({ value, onChange, placeholder, rows=4, mono=false, readOnly=false }) {
+  return <textarea value={value} onChange={e => !readOnly && onChange(e.target.value)} placeholder={placeholder} rows={rows} readOnly={readOnly}
+    className={`w-full bg-stone-800 border border-stone-600 text-stone-100 px-3 py-2 text-sm placeholder-stone-500 focus:border-amber-700 ${mono ? 'mono' : ''} ${readOnly ? 'opacity-60 cursor-not-allowed' : ''}`} />;
+}
+function Stars({ rating, onRate, size='text-4xl' }) {
+  const [h, setH] = useState(0);
+  return (
+    <div className="flex gap-1" onMouseLeave={() => setH(0)}>
+      {[1,2,3,4,5].map(n => (
+        <span key={n} className={`${size} select-none cursor-pointer transition-colors`}
+          style={{ color: n <= (h || rating) ? '#c8860a' : '#3a3028' }}
+          onMouseEnter={() => setH(n)} onClick={() => onRate(n)}>★</span>
+      ))}
+    </div>
+  );
+}
+function TagBrand({ brand }) {
+  const c = { profbee: 'text-green-400 border-green-800', wnr: 'text-purple-300 border-purple-800', nctr: 'text-amber-400 border-amber-800' };
+  return <span className={`text-xs border px-2 py-0.5 mono ${c[brand] || 'text-stone-400 border-stone-700'}`}>{BL[brand] || brand}</span>;
+}
+function TagTask({ task }) {
+  return <span className="text-xs border border-stone-700 text-stone-400 px-2 py-0.5 mono">{TL[task] || task}</span>;
+}
+function BrandSelector({ value, onChange }) {
+  return (
+    <div className="flex gap-2">
+      {BRANDS.map(b => (
+        <button key={b.id} onClick={() => onChange(b.id)}
+          className={`flex-1 border px-3 py-3 text-left transition-colors cursor-pointer bg-transparent border-stone-700 text-stone-400 brand-${b.id} ${value === b.id ? 'active' : 'hover:text-stone-200'}`}>
+          <div className={`text-xs font-semibold ${b.id === 'nctr' ? 'tracking-wide' : ''}`}>{b.label}</div>
+          <div className="text-xs opacity-60 mt-0.5">{b.sub}</div>
+        </button>
+      ))}
+    </div>
+  );
+}
+function TaskSelector({ value, onChange }) {
+  return (
+    <div className="flex flex-wrap gap-1">
+      {TASKS.map(t => (
+        <button key={t.id} onClick={() => onChange(t.id)}
+          className={`px-3 py-1.5 text-xs border cursor-pointer transition-colors ${value === t.id ? 'border-amber-600 text-amber-400 bg-amber-950' : 'border-stone-700 text-stone-400 hover:border-stone-500 hover:text-stone-200 bg-transparent'}`}>
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ─── DimensionRater ───────────────────────────────────────────────────────────
+function DimensionRater({ scores, onChange, focusDimension = null }) {
+  const ratedCount = DIMENSIONS.filter(d => scores[d.id] != null).length;
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center justify-between mb-2">
+        <p className="text-xs text-stone-500 uppercase tracking-widest">Rate this output</p>
+        <span className="text-xs text-stone-600 mono">{ratedCount} of 5 rated</span>
+      </div>
+      {DIMENSIONS.map(dim => {
+        const isFocus = focusDimension === dim.id;
+        const starSize = isFocus ? 'text-3xl' : 'text-2xl';
+        return (
+          <div key={dim.id} className={`flex items-center gap-3 px-2 py-1.5 rounded transition-colors ${isFocus ? 'border border-amber-700 bg-amber-950' : 'border border-transparent'}`}>
+            <div className="w-24 flex-shrink-0">
+              <span className={`text-xs font-medium ${isFocus ? 'text-amber-400' : 'text-stone-300'}`}>
+                {isFocus ? `FOCUS: ${dim.label}` : dim.label}
+              </span>
+            </div>
+            <span className={`text-xs flex-1 ${isFocus ? 'text-stone-400' : 'text-stone-600'}`}>{dim.desc}</span>
+            <Stars rating={scores[dim.id] || 0} onRate={(n) => onChange({ ...scores, [dim.id]: n })} size={starSize} />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Spinner ──────────────────────────────────────────────────────────────────
+function Spinner({ text = 'Loading...' }) {
+  return (
+    <div className="flex items-center gap-2 text-stone-500 text-sm py-4">
+      <svg className="animate-spin h-4 w-4 text-amber-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+      </svg>
+      <span>{text}</span>
+    </div>
+  );
+}
+
+// ─── Generate View ────────────────────────────────────────────────────────────
+function GenerateView() {
+  const { currentUserId, pickedBrief, setPickedBrief, setActiveView } = useContext(AppContext);
+  const hasKey = !!(CONFIG.apiKey() && CONFIG.apiKey() !== 'sk-YOUR-KEY-HERE');
+
+  const [brand, setBrand] = useState('wnr');
+  const [task, setTask] = useState('ig_caption');
+  const [lang, setLang] = useState('Indonesian');
+  const [brief, setBrief] = useState('');
+  const [output, setOutput] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [dimensionScores, setDimensionScores] = useState({ hook: null, specificity: null, voice_fit: null, tension: null, originality: null });
+  const [ratingsSaved, setRatingsSaved] = useState(false);
+  const [focusMode, setFocusMode] = useState(false);
+  const [focusDimension, setFocusDimension] = useState('hook');
+  const [briefLocked, setBriefLocked] = useState(false);
+  const [showExForm, setShowExForm] = useState(false);
+  const [showAntiExForm, setShowAntiExForm] = useState(false);
+  const [exNotes, setExNotes] = useState('');
+  const [antiExWhyBad, setAntiExWhyBad] = useState('');
+  const [showNotesForm, setShowNotesForm] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [badge, setBadge] = useState('');
+  const [corr, setCorr] = useState({ what_worked:'', what_failed:'', why_it_failed:'', extracted_rule:'', corrected_output:'' });
+  const [currentGenerationId, setCurrentGenerationId] = useState(null);
+
+  // Pick up brief from Brief Bank context
+  useEffect(() => {
+    if (pickedBrief) {
+      setBrief(pickedBrief);
+      setPickedBrief(null);
+    }
+  }, [pickedBrief]);
+
+  const resetRatingState = () => {
+    setDimensionScores({ hook: null, specificity: null, voice_fit: null, tension: null, originality: null });
+    setRatingsSaved(false);
+    setShowExForm(false);
+    setShowAntiExForm(false);
+    setShowNotesForm(false);
+    setExNotes('');
+    setAntiExWhyBad('');
+    setCorr({ what_worked:'', what_failed:'', why_it_failed:'', extracted_rule:'', corrected_output:'' });
+    setCurrentGenerationId(null);
+  };
+
+  const generate = useCallback(async () => {
+    if (!brief.trim()) { setError('Brief cannot be empty.'); return; }
+    setLoading(true); setError(''); setOutput(null);
+    resetRatingState();
+    try {
+      const activeFocus = focusMode ? focusDimension : null;
+      const sys = await assemblePrompt(brand, task, activeFocus);
+      const msg = `Brand: ${BL[brand]}\nTask: ${TL[task]}\nLanguage: ${lang}\nBrief: ${brief}`;
+      const text = await callOpenAI(sys, msg);
+      const newOutput = { text, brand, task, brief, lang, date: new Date().toISOString(), focusDimension: activeFocus };
+      setOutput(newOutput);
+
+      // Save generation to Supabase
+      if (currentUserId) {
+        const { data: gen } = await supabase.from('generations').insert({
+          brand, task_type: task, brief, output: text,
+          model: CONFIG.model, temperature: CONFIG.temperature,
+          user_id: currentUserId,
+          focus_dimension: activeFocus || null
+        }).select('id').single();
+        if (gen) setCurrentGenerationId(gen.id);
+      }
+    } catch(e) { setError(e.message || 'API call failed.'); }
+    finally { setLoading(false); }
+  }, [brand, task, lang, brief, focusMode, focusDimension, currentUserId]);
+
+  const computeOverall = (scores) => {
+    const rated = DIMENSIONS.map(d => scores[d.id]).filter(v => v != null);
+    if (rated.length === 0) return null;
+    return rated.reduce((a, b) => a + b, 0) / rated.length;
+  };
+
+  const computeWorstDimension = (scores) => {
+    const rated = Object.entries(scores).filter(([, v]) => v != null);
+    if (rated.length === 0) return null;
+    return rated.reduce((a, b) => a[1] < b[1] ? a : b)[0];
+  };
+
+  const saveRatings = async () => {
+    if (!output) return;
+    const overall = computeOverall(dimensionScores);
+    if (currentGenerationId && currentUserId) {
+      await supabase.from('ratings').insert({
+        generation_id: currentGenerationId,
+        rater_id: currentUserId,
+        rater_type: 'human',
+        score_hook: dimensionScores.hook,
+        score_specificity: dimensionScores.specificity,
+        score_voice_fit: dimensionScores.voice_fit,
+        score_tension: dimensionScores.tension,
+        score_originality: dimensionScores.originality,
+        overall,
+        notes: null
+      });
+    }
+    setRatingsSaved(true);
+    const anyFive = DIMENSIONS.some(d => dimensionScores[d.id] === CONFIG.singleDimensionExemplarScore);
+    if (overall != null && (overall >= CONFIG.exemplarThreshold || anyFive)) {
+      setShowExForm(true);
+    } else if (overall != null && overall <= CONFIG.antiExemplarThreshold) {
+      setShowAntiExForm(true);
+    }
+  };
+
+  const saveExemplar = async () => {
+    if (!output) return;
+    const overall = computeOverall(dimensionScores);
+    await supabase.from('exemplars').insert({
+      generation_id: currentGenerationId,
+      brand: output.brand, task_type: output.task,
+      brief: output.brief, output: output.text,
+      weighted_overall: overall,
+      score_hook: dimensionScores.hook,
+      score_specificity: dimensionScores.specificity,
+      score_voice_fit: dimensionScores.voice_fit,
+      score_tension: dimensionScores.tension,
+      score_originality: dimensionScores.originality,
+      notes: exNotes
+    });
+    setBadge('Exemplar saved.'); setShowExForm(false); setExNotes('');
+    setTimeout(() => setBadge(''), 3000);
+  };
+
+  const saveAntiExemplar = async () => {
+    if (!output) return;
+    const overall = computeOverall(dimensionScores);
+    const worst = computeWorstDimension(dimensionScores);
+    await supabase.from('anti_exemplars').insert({
+      generation_id: currentGenerationId,
+      brand: output.brand, task_type: output.task,
+      brief: output.brief, output: output.text,
+      weighted_overall: overall,
+      worst_dimension: worst,
+      score_hook: dimensionScores.hook,
+      score_specificity: dimensionScores.specificity,
+      score_voice_fit: dimensionScores.voice_fit,
+      score_tension: dimensionScores.tension,
+      score_originality: dimensionScores.originality,
+      why_bad: antiExWhyBad
+    });
+    setBadge('Anti-exemplar saved. The model will avoid this pattern.');
+    setShowAntiExForm(false); setAntiExWhyBad('');
+    setTimeout(() => setBadge(''), 4000);
+  };
+
+  const saveNotes = async () => {
+    if (!output) return;
+    const entry = { id: uuid(), date: new Date().toISOString(),
+      brand: output.brand, task_type: output.task, agent_output: output.text, ...corr };
+    const arr = await getCorrections(output.brand, output.task);
+    arr.unshift(entry);
+    await setCorrections(output.brand, output.task, arr);
+    if (corr.extracted_rule.trim()) {
+      // Save as task rule in Supabase rules table
+      await supabase.from('rules').insert({
+        scope: 'task', task_type: output.task,
+        text: corr.extracted_rule.trim(),
+        source: 'correction', active: true
+      });
+      setBadge(`Rule saved: "${corr.extracted_rule}"`);
+    } else {
+      setBadge('Notes saved.');
+    }
+    setShowNotesForm(false);
+    setCorr({ what_worked:'', what_failed:'', why_it_failed:'', extracted_rule:'', corrected_output:'' });
+    setTimeout(() => setBadge(''), 4000);
+  };
+
+  const copyText = () => {
+    if (!output) return;
+    navigator.clipboard.writeText(output.text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2000); });
+  };
+
+  const ratedCount = DIMENSIONS.filter(d => dimensionScores[d.id] != null).length;
+
+  return (
+    <div className="flex flex-col gap-6">
+      {!hasKey && (
+        <div className="border border-red-800 bg-red-950 px-4 py-3 text-sm text-red-300">
+          API key not found. Add your key to index.html as window.__PROFBEE_KEY__.
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Input panel */}
+        <div className="flex flex-col gap-4">
+          <Card><Lbl>Brand</Lbl><BrandSelector value={brand} onChange={setBrand} /></Card>
+          <Card><Lbl>Task Type</Lbl><TaskSelector value={task} onChange={setTask} /></Card>
+          <Card>
+            <div className="flex items-center justify-between mb-2">
+              <Lbl>Language</Lbl>
+              <div className="flex gap-1">
+                {['Indonesian','English'].map(l => (
+                  <button key={l} onClick={() => setLang(l)} className={`px-3 py-1 text-xs border cursor-pointer transition-colors ${lang===l ? 'border-amber-600 text-amber-400 bg-amber-950' : 'border-stone-700 text-stone-500 hover:text-stone-300 bg-transparent'}`}>{l}</button>
+                ))}
+              </div>
+            </div>
+            <Lbl>Brief</Lbl>
+            <TA value={brief} onChange={setBrief} placeholder="What do you need? Be specific: variant, hook angle, use case." rows={5} readOnly={briefLocked} />
+            {briefLocked && <p className="text-xs text-stone-600 mt-1">Brief locked for focus session</p>}
+            <button onClick={() => setActiveView('briefbank')} className="text-xs text-amber-600 hover:text-amber-400 cursor-pointer mt-2 bg-transparent border-none">Browse Brief Bank</button>
+          </Card>
+
+          {/* Focus Mode */}
+          <Card>
+            <div className="flex items-center gap-2 mb-3">
+              <p className="text-xs text-stone-400 uppercase tracking-wide mr-2">Mode</p>
+              {['Normal', 'Focus'].map(m => (
+                <button key={m} onClick={() => setFocusMode(m === 'Focus')}
+                  className={`px-3 py-1 text-xs border cursor-pointer transition-colors ${(m === 'Focus') === focusMode ? 'border-amber-600 text-amber-400 bg-amber-950' : 'border-stone-700 text-stone-500 hover:text-stone-300 bg-transparent'}`}>
+                  {m} Mode
+                </button>
+              ))}
+            </div>
+            {focusMode && (
+              <div className="flex flex-col gap-3 slide-in">
+                <div>
+                  <p className="text-xs text-stone-500 mb-2">Focus dimension</p>
+                  <div className="flex flex-wrap gap-1">
+                    {DIMENSIONS.map(d => (
+                      <button key={d.id} onClick={() => setFocusDimension(d.id)}
+                        className={`px-2 py-1 text-xs border cursor-pointer transition-colors ${focusDimension === d.id ? 'border-amber-600 text-amber-400 bg-amber-950' : 'border-stone-700 text-stone-500 hover:text-stone-300 bg-transparent'}`}>
+                        {d.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" checked={briefLocked} onChange={e => setBriefLocked(e.target.checked)} className="accent-amber-600" />
+                  <span className="text-xs text-stone-400">Lock Brief</span>
+                </label>
+              </div>
+            )}
+          </Card>
+
+          <Btn onClick={generate} disabled={loading || !brief.trim() || !hasKey} className="w-full py-3 text-base">
+            {loading ? 'Generating...' : 'Generate'}
+          </Btn>
+          {error && <p className="text-red-400 text-sm">{error}</p>}
+        </div>
+
+        {/* Output panel */}
+        <div className="flex flex-col gap-4">
+          {output ? (
+            <>
+              <Card>
+                <div className="flex items-center gap-2 mb-3 flex-wrap">
+                  <TagBrand brand={output.brand} /><TagTask task={output.task} />
+                  {output.focusDimension && (
+                    <span className="text-xs border border-amber-800 text-amber-500 px-2 py-0.5 mono">focus: {output.focusDimension}</span>
+                  )}
+                  <span className="text-xs text-stone-500 mono">{new Date(output.date).toLocaleDateString()}</span>
+                  <button onClick={copyText} className="ml-auto text-xs text-stone-400 hover:text-amber-400 cursor-pointer border border-stone-700 px-2 py-0.5 transition-colors bg-transparent">{copied ? 'Copied!' : 'Copy'}</button>
+                </div>
+                <details className="mb-3">
+                  <summary className="text-xs text-stone-500 cursor-pointer hover:text-stone-300">Brief</summary>
+                  <p className="text-xs text-stone-400 mt-1 pl-2 border-l border-stone-700">{output.brief}</p>
+                </details>
+                <pre className="mono text-sm text-stone-100 whitespace-pre-wrap leading-relaxed">{output.text}</pre>
+                <div className="flex gap-2 mt-3"><Btn onClick={generate} variant="ghost" small>Regenerate</Btn></div>
+              </Card>
+
+              {/* Dimension rating */}
+              <Card>
+                <DimensionRater scores={dimensionScores} onChange={setDimensionScores} focusDimension={focusMode ? focusDimension : null} />
+                {!ratingsSaved && ratedCount > 0 && (
+                  <div className="mt-3">
+                    <Btn onClick={saveRatings} small>Save Ratings</Btn>
+                  </div>
+                )}
+                {ratingsSaved && (
+                  <p className="text-xs text-green-500 mt-3">
+                    Ratings saved{computeOverall(dimensionScores) != null && ` · overall ${computeOverall(dimensionScores).toFixed(1)}`}
+                  </p>
+                )}
+              </Card>
+
+              {/* Exemplar save panel */}
+              {showExForm && (
+                <Card className="slide-in" style={{ borderColor: '#166534' }}>
+                  <p className="text-sm text-green-400 font-medium mb-3">Save as Exemplar?</p>
+                  <Lbl>What made this work? (optional)</Lbl>
+                  <TA value={exNotes} onChange={setExNotes} rows={3} placeholder="Why this is a strong example..." />
+                  <div className="flex gap-2 mt-3">
+                    <Btn onClick={saveExemplar}>Save Exemplar</Btn>
+                    <Btn onClick={() => setShowExForm(false)} variant="ghost">Skip</Btn>
+                  </div>
+                </Card>
+              )}
+
+              {/* Anti-exemplar save panel */}
+              {showAntiExForm && (
+                <Card className="slide-in" style={{ borderColor: '#7f1d1d' }}>
+                  <p className="text-sm text-red-400 font-medium mb-3">Save as Anti-Exemplar?</p>
+                  <p className="text-xs text-stone-500 mb-3">The model will be shown this as a failure pattern to avoid.</p>
+                  <Lbl>Why is this bad? (optional)</Lbl>
+                  <TA value={antiExWhyBad} onChange={setAntiExWhyBad} rows={3} placeholder="What specifically failed..." />
+                  <div className="flex gap-2 mt-3">
+                    <Btn onClick={saveAntiExemplar}>Save Anti-Exemplar</Btn>
+                    <Btn onClick={() => setShowAntiExForm(false)} variant="ghost">Skip</Btn>
+                  </div>
+                </Card>
+              )}
+
+              {/* Notes (optional) */}
+              {ratingsSaved && (
+                <div className="slide-in">
+                  <button onClick={() => setShowNotesForm(v => !v)} className="text-xs text-stone-500 hover:text-stone-300 cursor-pointer bg-transparent border-none flex items-center gap-1">
+                    <span>{showNotesForm ? '▾' : '▸'}</span> Add notes (optional)
+                  </button>
+                  {showNotesForm && (
+                    <Card className="mt-2 slide-in border-stone-700">
+                      {[
+                        { label: 'What worked', key: 'what_worked' },
+                        { label: 'What failed', key: 'what_failed' },
+                        { label: 'Why it failed — the principle behind it', key: 'why_it_failed', ph: 'Forces generalization, not venting.' },
+                        { label: 'Extracted rule (one sentence, generalizable)', key: 'extracted_rule', mono: true, ph: 'This is the compounding unit.' },
+                        { label: 'Corrected output — what it should have been', key: 'corrected_output', mono: true, rows: 4 },
+                      ].map(f => (
+                        <div key={f.key} className="mb-3">
+                          <Lbl>{f.label}</Lbl>
+                          <TA value={corr[f.key]} onChange={v => setCorr(c => ({ ...c, [f.key]: v }))} rows={f.rows || 2} mono={f.mono} placeholder={f.ph} />
+                        </div>
+                      ))}
+                      <Btn onClick={saveNotes} small>Save Notes</Btn>
+                    </Card>
+                  )}
+                </div>
+              )}
+
+              {badge && <div className="fade-badge border border-amber-700 bg-amber-950 px-4 py-2 text-sm text-amber-300 mono">{badge}</div>}
+            </>
+          ) : (
+            <Card className="flex items-center justify-center h-64 text-stone-600 text-sm">
+              {loading ? <Spinner text="Generating copy..." /> : 'Output will appear here.'}
+            </Card>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Exemplars View ───────────────────────────────────────────────────────────
+function ExemplarsView() {
+  const [activeBrand, setActiveBrand] = useState('wnr');
+  const [activeTask, setActiveTask] = useState('ig_caption');
+  const [subTab, setSubTab] = useState('exemplars');
+  const [exList, setExList] = useState([]);
+  const [antiList, setAntiList] = useState([]);
+  const [loadingEx, setLoadingEx] = useState(false);
+  const [delConfirm, setDelConfirm] = useState(null);
+  const [expanded, setExpanded] = useState({});
+
+  useEffect(() => {
+    setLoadingEx(true);
+    Promise.all([
+      supabase.from('exemplars').select('*').eq('brand', activeBrand).eq('task_type', activeTask).order('weighted_overall', { ascending: false }),
+      supabase.from('anti_exemplars').select('*').eq('brand', activeBrand).eq('task_type', activeTask).order('weighted_overall', { ascending: true }),
+    ]).then(([exRes, antiRes]) => {
+      setExList(exRes.data || []);
+      setAntiList(antiRes.data || []);
+      setLoadingEx(false);
+    });
+  }, [activeBrand, activeTask]);
+
+  const delEx = async (id) => {
+    await supabase.from('exemplars').delete().eq('id', id);
+    setExList(a => a.filter(e => e.id !== id));
+    setDelConfirm(null);
+  };
+  const delAnti = async (id) => {
+    await supabase.from('anti_exemplars').delete().eq('id', id);
+    setAntiList(a => a.filter(e => e.id !== id));
+    setDelConfirm(null);
+  };
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-lg font-semibold text-stone-100">Exemplars</h2>
+        <div className="flex gap-3 text-xs text-stone-500 mono">
+          <span>{exList.length} exemplars</span>
+          <span>{antiList.length} anti-exemplars</span>
+        </div>
+      </div>
+
+      <div className="flex gap-1 border-b border-stone-700">
+        {BRANDS.map(b => <button key={b.id} onClick={() => setActiveBrand(b.id)} className={`px-4 py-2 text-sm cursor-pointer transition-colors border-b-2 -mb-px ${activeBrand===b.id ? 'border-amber-600 text-amber-400' : 'border-transparent text-stone-500 hover:text-stone-300'} bg-transparent`}>{b.label}</button>)}
+      </div>
+
+      <div className="flex flex-wrap gap-1">
+        {TASKS.map(t => <button key={t.id} onClick={() => setActiveTask(t.id)} className={`px-3 py-1 text-xs border cursor-pointer transition-colors ${activeTask===t.id ? 'border-amber-600 text-amber-400 bg-amber-950' : 'border-stone-700 text-stone-500 hover:text-stone-300 bg-transparent'}`}>{t.label}</button>)}
+      </div>
+
+      <div className="flex gap-1">
+        <button onClick={() => setSubTab('exemplars')} className={`px-4 py-1.5 text-xs border cursor-pointer transition-colors ${subTab==='exemplars' ? 'border-amber-600 text-amber-400 bg-amber-950' : 'border-stone-700 text-stone-500 hover:text-stone-300 bg-transparent'}`}>
+          Exemplars ({exList.length})
+        </button>
+        <button onClick={() => setSubTab('anti')} className={`px-4 py-1.5 text-xs border cursor-pointer transition-colors ${subTab==='anti' ? 'border-red-700 text-red-400 bg-red-950' : 'border-stone-700 text-stone-500 hover:text-stone-300 bg-transparent'}`}>
+          Anti-Exemplars ({antiList.length})
+        </button>
+      </div>
+
+      {loadingEx && <Spinner />}
+
+      {!loadingEx && subTab === 'exemplars' && (
+        exList.length === 0 ? (
+          <Card className="text-center py-10 text-stone-600 text-sm">No exemplars yet for {BL[activeBrand]} · {TL[activeTask]}</Card>
+        ) : (
+          <div className="flex flex-col gap-4">
+            {exList.map(ex => (
+              <Card key={ex.id}>
+                <div className="flex items-start justify-between gap-4 mb-3">
+                  <div className="flex items-center gap-3 flex-wrap">
+                    {ex.weighted_overall != null && <span className="text-sm text-amber-400 mono font-medium">{parseFloat(ex.weighted_overall).toFixed(1)}/5</span>}
+                    <div className="flex gap-2 flex-wrap">
+                      {DIMENSIONS.map(d => ex[`score_${d.id}`] != null && (
+                        <span key={d.id} className="text-xs text-stone-500 mono">{d.label.slice(0,3).toLowerCase()}:{ex[`score_${d.id}`]}</span>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="flex gap-1">
+                    {delConfirm === ex.id
+                      ? <><Btn onClick={() => delEx(ex.id)} variant="danger" small>Confirm</Btn><Btn onClick={() => setDelConfirm(null)} variant="ghost" small>Cancel</Btn></>
+                      : <Btn onClick={() => setDelConfirm(ex.id)} variant="danger" small>Delete</Btn>}
+                  </div>
+                </div>
+                <details className="mb-2"><summary className="text-xs text-stone-500 cursor-pointer">Brief</summary><p className="text-xs text-stone-400 mt-1 pl-2 border-l border-stone-700">{ex.brief}</p></details>
+                <div className="mb-3">
+                  <pre className="mono text-sm text-stone-200 whitespace-pre-wrap leading-relaxed" style={!expanded[ex.id] ? { display:'-webkit-box', WebkitLineClamp:3, WebkitBoxOrient:'vertical', overflow:'hidden' } : {}}>{ex.output}</pre>
+                  <button onClick={() => setExpanded(s => ({...s, [ex.id]: !s[ex.id]}))} className="text-xs text-amber-600 hover:text-amber-400 cursor-pointer mt-1 bg-transparent border-none">{expanded[ex.id] ? 'Collapse' : 'Expand'}</button>
+                </div>
+                {ex.notes && <p className="text-xs text-stone-400 border-l-2 border-stone-700 pl-2">{ex.notes}</p>}
+              </Card>
+            ))}
+          </div>
+        )
+      )}
+
+      {!loadingEx && subTab === 'anti' && (
+        antiList.length === 0 ? (
+          <Card className="text-center py-10 text-stone-600 text-sm">No anti-exemplars yet for {BL[activeBrand]} · {TL[activeTask]}</Card>
+        ) : (
+          <div className="flex flex-col gap-4">
+            {antiList.map(ex => (
+              <Card key={ex.id} style={{ borderColor: '#450a0a' }}>
+                <div className="flex items-start justify-between gap-4 mb-3">
+                  <div className="flex items-center gap-3 flex-wrap">
+                    {ex.weighted_overall != null && <span className="text-sm text-red-400 mono font-medium">{parseFloat(ex.weighted_overall).toFixed(1)}/5</span>}
+                    {ex.worst_dimension && (
+                      <span className="text-xs border border-red-900 text-red-400 px-2 py-0.5 mono">worst: {ex.worst_dimension}</span>
+                    )}
+                    <div className="flex gap-2 flex-wrap">
+                      {DIMENSIONS.map(d => ex[`score_${d.id}`] != null && (
+                        <span key={d.id} className="text-xs text-stone-500 mono">{d.label.slice(0,3).toLowerCase()}:{ex[`score_${d.id}`]}</span>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="flex gap-1">
+                    {delConfirm === ex.id
+                      ? <><Btn onClick={() => delAnti(ex.id)} variant="danger" small>Confirm</Btn><Btn onClick={() => setDelConfirm(null)} variant="ghost" small>Cancel</Btn></>
+                      : <Btn onClick={() => setDelConfirm(ex.id)} variant="danger" small>Delete</Btn>}
+                  </div>
+                </div>
+                {ex.why_bad && <p className="text-xs text-red-300 border-l-2 border-red-900 pl-3 mb-3">{ex.why_bad}</p>}
+                <details className="mb-2"><summary className="text-xs text-stone-500 cursor-pointer">Brief</summary><p className="text-xs text-stone-400 mt-1 pl-2 border-l border-stone-700">{ex.brief}</p></details>
+                <div>
+                  <pre className="mono text-sm text-stone-400 whitespace-pre-wrap leading-relaxed" style={!expanded[ex.id] ? { display:'-webkit-box', WebkitLineClamp:3, WebkitBoxOrient:'vertical', overflow:'hidden' } : {}}>{ex.output}</pre>
+                  <button onClick={() => setExpanded(s => ({...s, [ex.id]: !s[ex.id]}))} className="text-xs text-stone-600 hover:text-stone-400 cursor-pointer mt-1 bg-transparent border-none">{expanded[ex.id] ? 'Collapse' : 'Expand'}</button>
+                </div>
+              </Card>
+            ))}
+          </div>
+        )
+      )}
+    </div>
+  );
+}
+
+// ─── Correction Log ───────────────────────────────────────────────────────────
+function CorrectionLogView() {
+  const [fb, setFb] = useState('all');
+  const [ft, setFt] = useState('all');
+  const [exp, setExp] = useState({});
+  const [allCorr, setAllCorr] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const load = async () => {
+      setLoading(true);
+      const all = [];
+      for (const b of BRANDS) {
+        for (const t of TASKS) {
+          const entries = await getCorrections(b.id, t.id);
+          entries.forEach(c => all.push(c));
+        }
+      }
+      all.sort((a,b) => new Date(b.date) - new Date(a.date));
+      setAllCorr(all);
+      setLoading(false);
+    };
+    load();
+  }, []);
+
+  const filtered = allCorr.filter(c => (fb==='all' || c.brand===fb) && (ft==='all' || c.task_type===ft));
+
+  const exportJSON = () => {
+    const blob = new Blob([JSON.stringify(allCorr, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href=url; a.download=`profbee-corrections-${new Date().toISOString().slice(0,10)}.json`; a.click(); URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-lg font-semibold text-stone-100">Correction Log</h2>
+        <Btn onClick={exportJSON} variant="ghost" small>Export All as JSON</Btn>
+      </div>
+      {loading ? <Spinner /> : (
+        <>
+          <div className="flex gap-3 flex-wrap">
+            <div className="flex gap-1 flex-wrap">
+              {[{id:'all',label:'All brands'}, ...BRANDS.map(b=>({id:b.id,label:b.short}))].map(b => (
+                <button key={b.id} onClick={() => setFb(b.id)} className={`px-3 py-1 text-xs border cursor-pointer transition-colors ${fb===b.id ? 'border-amber-600 text-amber-400 bg-amber-950' : 'border-stone-700 text-stone-500 bg-transparent'}`}>{b.label}</button>
+              ))}
+            </div>
+            <select value={ft} onChange={e => setFt(e.target.value)} className="bg-stone-800 border border-stone-600 text-stone-300 text-xs px-2 py-1">
+              <option value="all">All tasks</option>
+              {TASKS.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
+            </select>
+          </div>
+          {filtered.length === 0 ? <Card className="text-center py-10 text-stone-600 text-sm">No corrections yet.</Card> : (
+            <div className="flex flex-col gap-3">
+              {filtered.map(c => (
+                <Card key={c.id}>
+                  <div className="flex items-center gap-2 mb-2 flex-wrap"><TagBrand brand={c.brand} /><TagTask task={c.task_type} /><span className="text-xs text-stone-500 mono">{new Date(c.date).toLocaleDateString()}</span></div>
+                  {c.what_failed && <p className="text-xs text-stone-400 mb-2"><span className="text-stone-500">Failed: </span>{c.what_failed.slice(0,120)}{c.what_failed.length>120?'...':''}</p>}
+                  {c.extracted_rule && <p className="text-sm text-amber-400 mono border-l-2 border-amber-700 pl-3 mb-2">{c.extracted_rule}</p>}
+                  {exp[c.id] ? (
+                    <div className="border-t border-stone-700 pt-3 mt-2 flex flex-col gap-2">
+                      {c.what_worked && <div><Lbl>What worked</Lbl><p className="text-xs text-stone-400">{c.what_worked}</p></div>}
+                      {c.what_failed && <div><Lbl>What failed</Lbl><p className="text-xs text-stone-400">{c.what_failed}</p></div>}
+                      {c.why_it_failed && <div><Lbl>Why it failed</Lbl><p className="text-xs text-stone-400">{c.why_it_failed}</p></div>}
+                      <div><Lbl>Agent output</Lbl><pre className="mono text-xs text-stone-400 whitespace-pre-wrap">{c.agent_output}</pre></div>
+                      {c.corrected_output && <div><Lbl>Corrected output</Lbl><pre className="mono text-xs text-stone-200 whitespace-pre-wrap">{c.corrected_output}</pre></div>}
+                      <button onClick={() => setExp(s=>({...s,[c.id]:false}))} className="text-xs text-stone-500 hover:text-stone-300 cursor-pointer text-left bg-transparent border-none">Collapse</button>
+                    </div>
+                  ) : <button onClick={() => setExp(s=>({...s,[c.id]:true}))} className="text-xs text-stone-500 hover:text-amber-400 cursor-pointer bg-transparent border-none">Expand full entry</button>}
+                </Card>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── Rule Card ────────────────────────────────────────────────────────────────
+function RuleCard({ rule, onEdit, onDelete }) {
+  const [editing, setEditing] = useState(false);
+  const [text, setText] = useState(rule.text);
+  return (
+    <div className="border border-stone-700 p-3 flex gap-3">
+      <div className="flex-1">
+        {editing ? (
+          <div className="flex gap-2">
+            <input value={text} onChange={e => setText(e.target.value)} className="flex-1 bg-stone-800 border border-stone-600 text-stone-100 px-2 py-1 text-xs mono" />
+            <Btn onClick={() => { onEdit({...rule, text}); setEditing(false); }} small>Save</Btn>
+            <Btn onClick={() => { setText(rule.text); setEditing(false); }} variant="ghost" small>Cancel</Btn>
+          </div>
+        ) : <p className="text-sm mono text-stone-200">{rule.text}</p>}
+        <div className="flex items-center gap-2 mt-1">
+          <span className="text-xs text-stone-600 mono">{rule.created_at ? new Date(rule.created_at).toLocaleDateString() : (rule.date ? new Date(rule.date).toLocaleDateString() : '')}</span>
+          <span className={rule.source==='correction' ? 'rule-tag-correction' : 'rule-tag-manual'}>[{rule.source||'manual'}]</span>
+        </div>
+      </div>
+      {!editing && <div className="flex gap-1"><Btn onClick={() => setEditing(true)} variant="ghost" small>Edit</Btn><Btn onClick={onDelete} variant="danger" small>x</Btn></div>}
+    </div>
+  );
+}
+
+// ─── System Prompt View ───────────────────────────────────────────────────────
+function SystemPromptView() {
+  const [pb, setPb] = useState('wnr');
+  const [pt, setPt] = useState('ig_caption');
+  const [ar, setAr] = useState([]);
+  const [tr, setTr] = useState({});
+  const [addingA, setAddingA] = useState(false);
+  const [newA, setNewA] = useState('');
+  const [addingT, setAddingT] = useState(null);
+  const [newT, setNewT] = useState('');
+  const [vl, setVl] = useState([]);
+  const [addingV, setAddingV] = useState(false);
+  const [newV, setNewV] = useState({ version_label:'', summary:'' });
+  const [loading, setLoading] = useState(true);
+  const [exCount, setExCount] = useState(0);
+  const [antiCount, setAntiCount] = useState(0);
+  const [promptLen, setPromptLen] = useState(0);
+
+  useEffect(() => {
+    const load = async () => {
+      setLoading(true);
+      const [alwaysR, taskVl] = await Promise.all([
+        getAlwaysRules(),
+        getVersionLog(),
+      ]);
+      const taskRulesObj = {};
+      for (const t of TASKS) {
+        taskRulesObj[t.id] = await getTaskRules(t.id);
+      }
+      setAr(alwaysR);
+      setTr(taskRulesObj);
+      setVl(taskVl);
+      setLoading(false);
+    };
+    load();
+  }, []);
+
+  useEffect(() => {
+    const loadPreview = async () => {
+      const [exs, antis, assembled] = await Promise.all([
+        getTopExemplars(pb, pt),
+        getTopAntiExemplars(pb, pt),
+        assemblePrompt(pb, pt),
+      ]);
+      setExCount(exs.length);
+      setAntiCount(antis.length);
+      setPromptLen(assembled.length);
+    };
+    loadPreview();
+  }, [pb, pt, ar, tr]);
+
+  const getTR = (t) => tr[t] || [];
+
+  const addAR = async () => {
+    if (!newA.trim()) return;
+    const { data } = await supabase.from('rules').insert({ scope: 'always', text: newA.trim(), source: 'manual', active: true }).select('*').single();
+    if (data) { setAr(a => [...a, data]); }
+    setNewA(''); setAddingA(false);
+  };
+  const editAR = async (r) => {
+    await supabase.from('rules').update({ text: r.text }).eq('id', r.id);
+    setAr(a => a.map(x => x.id === r.id ? r : x));
+  };
+  const delAR = async (id) => {
+    await supabase.from('rules').update({ active: false }).eq('id', id);
+    setAr(a => a.filter(r => r.id !== id));
+  };
+
+  const addTR = async (t) => {
+    if (!newT.trim()) return;
+    const { data } = await supabase.from('rules').insert({ scope: 'task', task_type: t, text: newT.trim(), source: 'manual', active: true }).select('*').single();
+    if (data) { setTr(s => ({ ...s, [t]: [...(s[t]||[]), data] })); }
+    setNewT(''); setAddingT(null);
+  };
+  const editTR = async (t, r) => {
+    await supabase.from('rules').update({ text: r.text }).eq('id', r.id);
+    setTr(s => ({ ...s, [t]: (s[t]||[]).map(x => x.id === r.id ? r : x) }));
+  };
+  const delTR = async (t, id) => {
+    await supabase.from('rules').update({ active: false }).eq('id', id);
+    setTr(s => ({ ...s, [t]: (s[t]||[]).filter(r => r.id !== id) }));
+  };
+
+  const logV = async () => {
+    if (!newV.version_label || !newV.summary) return;
+    const entry = { date: new Date().toISOString(), ...newV };
+    const updated = [entry, ...vl];
+    await setVersionLog(updated);
+    setVl(updated);
+    setNewV({ version_label:'', summary:'' });
+    setAddingV(false);
+  };
+
+  if (loading) return <Spinner />;
+
+  return (
+    <div className="flex flex-col gap-6">
+      <h2 className="text-lg font-semibold text-stone-100">System Prompt</h2>
+      <Card>
+        <p className="text-xs text-stone-500 uppercase tracking-widest mb-3">Live Preview</p>
+        <div className="flex gap-3 mb-4 flex-wrap">
+          <div><Lbl>Brand</Lbl><select value={pb} onChange={e=>setPb(e.target.value)} className="bg-stone-800 border border-stone-600 text-stone-300 text-xs px-2 py-1">{BRANDS.map(b=><option key={b.id} value={b.id}>{b.label}</option>)}</select></div>
+          <div><Lbl>Task</Lbl><select value={pt} onChange={e=>setPt(e.target.value)} className="bg-stone-800 border border-stone-600 text-stone-300 text-xs px-2 py-1">{TASKS.map(t=><option key={t.id} value={t.id}>{t.label}</option>)}</select></div>
+        </div>
+        <div className="border-t border-stone-700 pt-3 flex flex-col gap-2">
+          <details><summary className="text-xs text-stone-500 cursor-pointer hover:text-stone-300">Base prompt (click to expand)</summary><pre className="mono text-xs text-stone-400 whitespace-pre-wrap mt-2 max-h-48 overflow-y-auto">{BASE_PROMPT}</pre></details>
+          <div><p className="text-xs text-stone-500 mb-1">Hard rules active: {ar.length}</p>{ar.map(r=><p key={r.id} className="text-xs mono text-stone-300 pl-2 border-l border-stone-700 mb-0.5">- {r.text}</p>)}</div>
+          <div><p className="text-xs text-stone-500 mb-1">Task rules ({TL[pt]}): {getTR(pt).length}</p>{getTR(pt).map(r=><p key={r.id} className="text-xs mono text-stone-300 pl-2 border-l border-amber-900 mb-0.5">- {r.text}</p>)}</div>
+          <div><p className="text-xs text-stone-500 mb-1">Exemplars ({BL[pb]} · {TL[pt]}): {exCount}</p></div>
+          <div><p className="text-xs text-stone-500 mb-1">Anti-exemplars ({BL[pb]} · {TL[pt]}): {antiCount}</p></div>
+          <p className="text-xs text-stone-600 mono">Total prompt: ~{promptLen} chars</p>
+        </div>
+      </Card>
+
+      <div>
+        <div className="flex items-center justify-between mb-2"><p className="text-sm font-medium text-stone-200">Hard Rules (always apply)</p><Btn onClick={()=>setAddingA(true)} variant="amber" small>+ Add Rule</Btn></div>
+        {addingA && <div className="flex gap-2 mb-2 slide-in"><input value={newA} onChange={e=>setNewA(e.target.value)} placeholder="One sentence, generalizable rule..." className="flex-1 bg-stone-800 border border-stone-600 text-stone-100 px-3 py-2 text-sm mono" /><Btn onClick={addAR} small>Save</Btn><Btn onClick={()=>{setAddingA(false);setNewA('');}} variant="ghost" small>Cancel</Btn></div>}
+        {ar.length===0&&!addingA&&<p className="text-xs text-stone-600 border border-stone-800 p-3">No hard rules yet.</p>}
+        <div className="flex flex-col gap-2">{ar.map(r=><RuleCard key={r.id} rule={r} onEdit={editAR} onDelete={()=>delAR(r.id)} />)}</div>
+      </div>
+
+      <div>
+        <p className="text-sm font-medium text-stone-200 mb-3">Task-Specific Rules</p>
+        {TASKS.map(t => (
+          <div key={t.id} className="mb-4">
+            <div className="flex items-center justify-between mb-2"><TagTask task={t.id} /><Btn onClick={()=>setAddingT(t.id)} variant="amber" small>+ Add Rule</Btn></div>
+            {addingT===t.id && <div className="flex gap-2 mb-2 slide-in"><input value={newT} onChange={e=>setNewT(e.target.value)} placeholder="Rule for this task type..." className="flex-1 bg-stone-800 border border-stone-600 text-stone-100 px-3 py-2 text-sm mono" /><Btn onClick={()=>addTR(t.id)} small>Save</Btn><Btn onClick={()=>{setAddingT(null);setNewT('');}} variant="ghost" small>Cancel</Btn></div>}
+            {getTR(t.id).length===0&&addingT!==t.id&&<p className="text-xs text-stone-700 pl-2">No rules.</p>}
+            <div className="flex flex-col gap-2">{getTR(t.id).map(r=><RuleCard key={r.id} rule={r} onEdit={r=>editTR(t.id,r)} onDelete={()=>delTR(t.id,r.id)} />)}</div>
+          </div>
+        ))}
+      </div>
+
+      <div>
+        <div className="flex items-center justify-between mb-2"><p className="text-sm font-medium text-stone-200">Version Log</p><Btn onClick={()=>setAddingV(true)} variant="amber" small>+ Log Version</Btn></div>
+        {addingV && (
+          <Card className="mb-3 slide-in">
+            <div className="flex gap-3 flex-wrap">
+              <div className="flex-none w-28"><Lbl>Version</Lbl><input value={newV.version_label} onChange={e=>setNewV(v=>({...v,version_label:e.target.value}))} placeholder="v2.0" className="w-full bg-stone-800 border border-stone-600 text-stone-100 px-2 py-1 text-sm mono" /></div>
+              <div className="flex-1"><Lbl>Summary</Lbl><input value={newV.summary} onChange={e=>setNewV(v=>({...v,summary:e.target.value}))} placeholder="What changed and why" className="w-full bg-stone-800 border border-stone-600 text-stone-100 px-2 py-1 text-sm" /></div>
+            </div>
+            <div className="flex gap-2 mt-3"><Btn onClick={logV} small>Save</Btn><Btn onClick={()=>setAddingV(false)} variant="ghost" small>Cancel</Btn></div>
+          </Card>
+        )}
+        {vl.length===0 ? <p className="text-xs text-stone-600 border border-stone-800 p-3">No versions logged yet.</p> : (
+          <div className="border border-stone-700">
+            <div className="grid grid-cols-3 gap-4 px-4 py-2 border-b border-stone-700 text-xs text-stone-500 uppercase tracking-wide"><span>Version</span><span>Date</span><span>Summary</span></div>
+            {vl.map((v,i) => <div key={i} className="grid grid-cols-3 gap-4 px-4 py-2 border-b border-stone-800 text-xs hover:bg-stone-800 transition-colors"><span className="mono text-amber-400">{v.version_label}</span><span className="text-stone-500 mono">{new Date(v.date).toLocaleDateString()}</span><span className="text-stone-300">{v.summary}</span></div>)}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Analytics View ───────────────────────────────────────────────────────────
+function AnalyticsView() {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const load = async () => {
+      setLoading(true);
+      const result = [];
+      for (const b of BRANDS) {
+        for (const t of TASKS) {
+          // Fetch generations with ratings joined
+          const { data: gens } = await supabase.from('generations')
+            .select('id, brand, task_type, focus_dimension, created_at, ratings(score_hook, score_specificity, score_voice_fit, score_tension, score_originality, overall)')
+            .eq('brand', b.id).eq('task_type', t.id);
+          if (!gens || gens.length < 5) continue;
+
+          // Flatten: use first rating per generation
+          const rated = gens.filter(g => g.ratings && g.ratings.length > 0).map(g => {
+            const r = g.ratings[0];
+            return { ...r, date: g.created_at };
+          });
+          if (rated.length < 5) continue;
+
+          const dimAvgs = {};
+          DIMENSIONS.forEach(d => {
+            const vals = rated.map(r => r[`score_${d.id}`]).filter(v => v != null);
+            dimAvgs[d.id] = vals.length > 0 ? vals.reduce((a, x) => a + x, 0) / vals.length : null;
+          });
+          const overallVals = rated.map(r => r.overall).filter(v => v != null);
+          const overallAvg = overallVals.length > 0 ? overallVals.reduce((a, x) => a + x, 0) / overallVals.length : null;
+
+          let weakestDim = null, weakestVal = Infinity;
+          DIMENSIONS.forEach(d => { if (dimAvgs[d.id] != null && dimAvgs[d.id] < weakestVal) { weakestVal = dimAvgs[d.id]; weakestDim = d; } });
+
+          let trend = null;
+          if (rated.length >= 10) {
+            const sorted = [...rated].sort((a, b) => new Date(a.date) - new Date(b.date));
+            const first5Avg = sorted.slice(0, 5).filter(r => r.overall != null).reduce((a, g) => a + g.overall, 0) / 5;
+            const last5Avg  = sorted.slice(-5).filter(r => r.overall != null).reduce((a, g) => a + g.overall, 0) / 5;
+            const diff = last5Avg - first5Avg;
+            trend = diff > 0.2 ? 'improving' : diff < -0.2 ? 'declining' : 'stable';
+          }
+
+          const { data: antiData } = await supabase.from('anti_exemplars').select('id, worst_dimension').eq('brand', b.id).eq('task_type', t.id);
+          const antiCount = antiData ? antiData.length : 0;
+          let antiWorstDim = null;
+          if (antiData && antiData.length >= 5) {
+            const dimCounts = {};
+            antiData.forEach(a => { if (a.worst_dimension) dimCounts[a.worst_dimension] = (dimCounts[a.worst_dimension] || 0) + 1; });
+            const entries = Object.entries(dimCounts);
+            antiWorstDim = entries.length > 0 ? entries.reduce((a, b) => a[1] > b[1] ? a : b)[0] : null;
+          }
+
+          result.push({ brand: b.id, task: t.id, count: rated.length, dimAvgs, overallAvg, weakestDim, trend, antiCount, antiWorstDim });
+        }
+      }
+      setRows(result);
+      setLoading(false);
+    };
+    load();
+  }, []);
+
+  const cellColor = (val) => {
+    if (val == null) return 'text-stone-600';
+    if (val >= 4.0) return 'text-amber-400';
+    if (val >= 3.0) return 'text-stone-300';
+    return 'text-red-400';
+  };
+  const trendColor = (t) => t === 'improving' ? 'text-green-400' : t === 'declining' ? 'text-red-400' : 'text-stone-400';
+
+  return (
+    <div className="flex flex-col gap-6">
+      <h2 className="text-lg font-semibold text-stone-100">Analytics</h2>
+      {loading ? <Spinner text="Loading analytics..." /> : rows.length === 0 ? (
+        <Card className="text-center py-12 text-stone-600 text-sm">
+          No data yet. Rate at least 5 generations for a brand/task combination to see analytics.
+        </Card>
+      ) : (
+        <>
+          <Card className="overflow-x-auto">
+            <p className="text-xs text-stone-500 uppercase tracking-widest mb-4">Dimension Averages (5+ rated sessions)</p>
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b border-stone-700">
+                  <th className="text-left text-stone-500 pb-2 pr-4 font-medium">Brand / Task</th>
+                  <th className="text-left text-stone-500 pb-2 pr-3 font-medium">n</th>
+                  {DIMENSIONS.map(d => <th key={d.id} className="text-left text-stone-500 pb-2 pr-3 font-medium">{d.label}</th>)}
+                  <th className="text-left text-stone-500 pb-2 pr-3 font-medium">Overall</th>
+                  <th className="text-left text-stone-500 pb-2 font-medium">Anti</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map(row => (
+                  <tr key={`${row.brand}-${row.task}`} className="border-b border-stone-800 hover:bg-stone-800 transition-colors">
+                    <td className="py-2 pr-4"><div className="flex items-center gap-2"><TagBrand brand={row.brand} /><TagTask task={row.task} /></div></td>
+                    <td className="py-2 pr-3 text-stone-600 mono">{row.count}</td>
+                    {DIMENSIONS.map(d => (
+                      <td key={d.id} className={`py-2 pr-3 mono ${cellColor(row.dimAvgs[d.id])} ${row.weakestDim?.id === d.id ? 'underline' : ''}`}>
+                        {row.dimAvgs[d.id] != null ? row.dimAvgs[d.id].toFixed(1) : '—'}
+                      </td>
+                    ))}
+                    <td className={`py-2 pr-3 mono font-medium ${cellColor(row.overallAvg)}`}>{row.overallAvg != null ? row.overallAvg.toFixed(1) : '—'}</td>
+                    <td className={`py-2 mono ${row.antiCount >= 5 ? 'text-red-400' : 'text-stone-600'}`}>{row.antiCount}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="text-xs text-stone-600 mt-3">Color: <span className="text-amber-400">4.0+</span> · <span className="text-stone-300">3.0-3.9</span> · <span className="text-red-400">under 3.0</span> · Weakest dimension underlined</p>
+          </Card>
+
+          {rows.some(r => r.trend) && (
+            <Card>
+              <p className="text-xs text-stone-500 uppercase tracking-widest mb-3">Overall Trend (10+ rated sessions)</p>
+              <div className="flex flex-col gap-2">
+                {rows.filter(r => r.trend).map(row => (
+                  <div key={`${row.brand}-${row.task}-trend`} className="flex items-center gap-3">
+                    <TagBrand brand={row.brand} /><TagTask task={row.task} />
+                    <span className={`text-xs mono ${trendColor(row.trend)}`}>Overall trend: {row.trend}</span>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          )}
+
+          <Card>
+            <p className="text-xs text-stone-500 uppercase tracking-widest mb-3">Focus Mode Suggestions</p>
+            {rows.filter(r => r.weakestDim || r.antiWorstDim).map(row => (
+              <div key={`${row.brand}-${row.task}-suggest`} className="mb-3">
+                <div className="flex items-center gap-2 mb-1"><TagBrand brand={row.brand} /><TagTask task={row.task} /></div>
+                {row.weakestDim && (
+                  <p className="text-xs text-stone-400 mb-1">
+                    Weakest dimension: <span className="text-amber-400">{row.weakestDim.label}</span> ({row.dimAvgs[row.weakestDim.id]?.toFixed(1)}). Consider a Focus Mode session targeting <span className="text-amber-400">{row.weakestDim.label}</span>.
+                  </p>
+                )}
+                {row.antiWorstDim && (
+                  <p className="text-xs text-red-400">
+                    Strong negative signal on <span className="font-medium">{row.antiWorstDim}</span> from anti-exemplars — consider a Focus Mode session.
+                  </p>
+                )}
+              </div>
+            ))}
+            {rows.every(r => !r.weakestDim && !r.antiWorstDim) && (
+              <p className="text-xs text-stone-600">Not enough data yet for suggestions.</p>
+            )}
+          </Card>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── Review Queue View ────────────────────────────────────────────────────────
+function ReviewQueueView() {
+  const { currentUserId, userRole } = useContext(AppContext);
+  const isOwner = userRole === 'owner';
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [expanded, setExpanded] = useState({});
+  const [actionLoading, setActionLoading] = useState(null);
+  const [badge, setBadge] = useState('');
+
+  const load = async () => {
+    setLoading(true);
+    const { data } = await supabase.from('review_queue')
+      .select('*, generation:generation_id(brand, task_type, brief, output, model)')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false });
+    setItems(data || []);
+    setLoading(false);
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const stddev = (values) => {
+    if (!values || values.length < 2) return 0;
+    const mean = values.reduce((a, b) => a + b, 0) / values.length;
+    const variance = values.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / values.length;
+    return Math.sqrt(variance);
+  };
+
+  const getAgentVotes = (item) => {
+    if (!item.agent_votes) return [];
+    if (typeof item.agent_votes === 'string') {
+      try { return JSON.parse(item.agent_votes); } catch { return []; }
+    }
+    return Array.isArray(item.agent_votes) ? item.agent_votes : Object.values(item.agent_votes);
+  };
+
+  const approveAsExemplar = async (item) => {
+    setActionLoading(item.id);
+    const gen = item.generation || {};
+    await supabase.from('exemplars').insert({
+      generation_id: item.generation_id,
+      brand: gen.brand, task_type: gen.task_type,
+      brief: gen.brief, output: gen.output,
+      weighted_overall: item.avg_score || null,
+      notes: 'Approved via review queue'
+    });
+    await supabase.from('review_queue').update({ status: 'approved', reviewed_by: currentUserId }).eq('id', item.id);
+    setItems(prev => prev.filter(i => i.id !== item.id));
+    setBadge('Approved as exemplar.');
+    setTimeout(() => setBadge(''), 3000);
+    setActionLoading(null);
+  };
+
+  const approveAsAntiExemplar = async (item) => {
+    setActionLoading(item.id);
+    const gen = item.generation || {};
+    await supabase.from('anti_exemplars').insert({
+      generation_id: item.generation_id,
+      brand: gen.brand, task_type: gen.task_type,
+      brief: gen.brief, output: gen.output,
+      weighted_overall: item.avg_score || null,
+      why_bad: 'Approved via review queue as anti-exemplar'
+    });
+    await supabase.from('review_queue').update({ status: 'approved', reviewed_by: currentUserId }).eq('id', item.id);
+    setItems(prev => prev.filter(i => i.id !== item.id));
+    setBadge('Approved as anti-exemplar.');
+    setTimeout(() => setBadge(''), 3000);
+    setActionLoading(null);
+  };
+
+  const reject = async (item) => {
+    setActionLoading(item.id);
+    await supabase.from('review_queue').update({ status: 'rejected', reviewed_by: currentUserId }).eq('id', item.id);
+    setItems(prev => prev.filter(i => i.id !== item.id));
+    setBadge('Rejected.');
+    setTimeout(() => setBadge(''), 3000);
+    setActionLoading(null);
+  };
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-lg font-semibold text-stone-100">Review Queue</h2>
+        <div className="flex items-center gap-3">
+          {isOwner && <span className="text-xs border border-amber-700 text-amber-500 px-2 py-0.5 mono">owner</span>}
+          <span className="text-xs text-stone-500 mono">{items.length} pending</span>
+          <Btn onClick={load} variant="ghost" small>Refresh</Btn>
+        </div>
+      </div>
+
+      {!isOwner && (
+        <div className="border border-stone-700 bg-stone-900 px-4 py-3 text-xs text-stone-500">
+          You are viewing the review queue as a read-only observer. Approve/reject actions require owner role.
+        </div>
+      )}
+
+      {badge && <div className="fade-badge border border-amber-700 bg-amber-950 px-4 py-2 text-sm text-amber-300 mono">{badge}</div>}
+
+      {loading ? <Spinner text="Loading review queue..." /> : items.length === 0 ? (
+        <Card className="text-center py-12 text-stone-600 text-sm">No pending items in review queue.</Card>
+      ) : (
+        <div className="flex flex-col gap-4">
+          {items.map(item => {
+            const gen = item.generation || {};
+            const votes = getAgentVotes(item);
+            const scoreValues = votes.map(v => typeof v === 'object' ? (v.overall || v.score || 0) : v).filter(v => typeof v === 'number');
+            const sd = stddev(scoreValues);
+            const hasDisagreement = sd > 1.0;
+
+            return (
+              <Card key={item.id} className={hasDisagreement ? 'border-yellow-800' : ''}>
+                <div className="flex items-start justify-between gap-4 mb-3 flex-wrap">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {gen.brand && <TagBrand brand={gen.brand} />}
+                    {gen.task_type && <TagTask task={gen.task_type} />}
+                    {hasDisagreement && (
+                      <span className="text-xs border border-yellow-700 text-yellow-400 px-2 py-0.5 mono">disagreement stddev:{sd.toFixed(2)}</span>
+                    )}
+                    {item.avg_score != null && (
+                      <span className="text-xs text-stone-400 mono">avg: {parseFloat(item.avg_score).toFixed(1)}</span>
+                    )}
+                  </div>
+                  {isOwner && (
+                    <div className="flex gap-2 flex-wrap">
+                      <Btn onClick={() => approveAsExemplar(item)} variant="green" small disabled={actionLoading === item.id}>Approve as Exemplar</Btn>
+                      <Btn onClick={() => approveAsAntiExemplar(item)} variant="danger" small disabled={actionLoading === item.id}>Approve as Anti-Exemplar</Btn>
+                      <Btn onClick={() => reject(item)} variant="ghost" small disabled={actionLoading === item.id}>Reject</Btn>
+                    </div>
+                  )}
+                </div>
+
+                {gen.brief && (
+                  <details className="mb-3"><summary className="text-xs text-stone-500 cursor-pointer">Brief</summary><p className="text-xs text-stone-400 mt-1 pl-2 border-l border-stone-700">{gen.brief}</p></details>
+                )}
+
+                <div className="mb-3">
+                  <pre className="mono text-sm text-stone-200 whitespace-pre-wrap leading-relaxed" style={!expanded[item.id] ? { display:'-webkit-box', WebkitLineClamp:4, WebkitBoxOrient:'vertical', overflow:'hidden' } : {}}>{gen.output || '(no output)'}</pre>
+                  <button onClick={() => setExpanded(s => ({...s, [item.id]: !s[item.id]}))} className="text-xs text-amber-600 hover:text-amber-400 cursor-pointer mt-1 bg-transparent border-none">{expanded[item.id] ? 'Collapse' : 'Expand'}</button>
+                </div>
+
+                {votes.length > 0 && (
+                  <div className="border-t border-stone-800 pt-3 mt-2">
+                    <p className="text-xs text-stone-500 mb-2 uppercase tracking-wide">Agent scores</p>
+                    <div className="flex gap-3 flex-wrap">
+                      {votes.map((v, i) => (
+                        <div key={i} className="border border-stone-700 px-3 py-1.5 text-xs mono">
+                          {typeof v === 'object' ? (
+                            <div>
+                              <span className="text-stone-400">Agent {i+1}: </span>
+                              {v.overall != null && <span className="text-amber-400">overall:{v.overall} </span>}
+                              {v.hook != null && <span className="text-stone-400">hook:{v.hook} </span>}
+                              {v.specificity != null && <span className="text-stone-400">spec:{v.specificity} </span>}
+                              {v.voice_fit != null && <span className="text-stone-400">voice:{v.voice_fit} </span>}
+                              {v.tension != null && <span className="text-stone-400">tension:{v.tension} </span>}
+                              {v.originality != null && <span className="text-stone-400">orig:{v.originality}</span>}
+                            </div>
+                          ) : (
+                            <span className="text-stone-300">Agent {i+1}: {v}</span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                    {hasDisagreement && (
+                      <p className="text-xs text-yellow-500 mt-2">High disagreement between agents (stddev {sd.toFixed(2)} {">"} 1.0). Manual review recommended.</p>
+                    )}
+                  </div>
+                )}
+              </Card>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Brief Bank View ──────────────────────────────────────────────────────────
+function BriefBankView() {
+  const { setPickedBrief, setActiveView } = useContext(AppContext);
+  const [filterBrand, setFilterBrand] = useState('all');
+  const [filterTask, setFilterTask] = useState('all');
+  const [briefs, setBriefs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [newBrief, setNewBrief] = useState({ brand: 'wnr', task_type: 'ig_caption', text: '', segment: '', notes: '' });
+  const [badge, setBadge] = useState('');
+
+  // Revenue calculator state
+  const [revTarget, setRevTarget] = useState('');
+  const [avgOrder, setAvgOrder] = useState('');
+  const [convRate, setConvRate] = useState('');
+  const [revBrand, setRevBrand] = useState('nctr');
+  const [revTask, setRevTask] = useState('ig_caption');
+  const [revSegment, setRevSegment] = useState('');
+  const [revSkus, setRevSkus] = useState([]);
+  const [skuInput, setSkuInput] = useState('');
+  const [calcResult, setCalcResult] = useState(null);
+  const [genLoading, setGenLoading] = useState(false);
+  const [genError, setGenError] = useState('');
+
+  const loadBriefs = async () => {
+    setLoading(true);
+    let query = supabase.from('briefs').select('*').order('created_at', { ascending: false });
+    if (filterBrand !== 'all') query = query.eq('brand', filterBrand);
+    if (filterTask !== 'all') query = query.eq('task_type', filterTask);
+    const { data } = await query;
+    setBriefs(data || []);
+    setLoading(false);
+  };
+
+  useEffect(() => { loadBriefs(); }, [filterBrand, filterTask]);
+
+  const pickBrief = (brief) => {
+    setPickedBrief(brief.text);
+    setActiveView('generate');
+  };
+
+  const addBrief = async () => {
+    if (!newBrief.text.trim()) return;
+    await supabase.from('briefs').insert({
+      brand: newBrief.brand, task_type: newBrief.task_type,
+      text: newBrief.text.trim(), segment: newBrief.segment,
+      notes: newBrief.notes, source: 'manual'
+    });
+    setNewBrief({ brand: 'wnr', task_type: 'ig_caption', text: '', segment: '', notes: '' });
+    setShowAddForm(false);
+    setBadge('Brief added.');
+    setTimeout(() => setBadge(''), 3000);
+    await loadBriefs();
+  };
+
+  const deleteBrief = async (id) => {
+    await supabase.from('briefs').delete().eq('id', id);
+    setBriefs(prev => prev.filter(b => b.id !== id));
+  };
+
+  const computeVolume = () => {
+    const rev = parseFloat(revTarget);
+    const aov = parseFloat(avgOrder);
+    const cr = parseFloat(convRate) / 100;
+    if (!rev || !aov || !cr) return null;
+    const orders = rev / aov;
+    const contentVolume = Math.ceil(orders / cr);
+    return { orders: Math.ceil(orders), contentVolume };
+  };
+
+  const generateBriefs = async () => {
+    const vol = computeVolume();
+    if (!vol) { setGenError('Fill in all revenue calculator fields.'); return; }
+    if (revSkus.length === 0) { setGenError('Add at least one SKU.'); return; }
+    setGenLoading(true);
+    setGenError('');
+    setCalcResult(vol);
+    const N = Math.min(revSkus.length * 3, 15);
+    const skuList = revSkus.join(', ');
+    try {
+      for (const sku of revSkus) {
+        const n = Math.min(3, N);
+        const sysPrompt = `You write terse, specific copywriting briefs for an Indonesian honey brand. A brief tells a copywriting agent: brand, task, target, angle, and any constraints. It is not copy itself. Max 30 words.`;
+        const userMsg = `Write ${n} briefs for:\nBrand: ${BL[revBrand]}\nTask: ${TL[revTask]}\nSegment: ${revSegment || 'general'}\nContent job: drive purchase / increase conversions\nSKU: ${sku}\nReturn a JSON array of strings. No other text.`;
+        const raw = await callOpenAI(sysPrompt, userMsg);
+        let parsed = [];
+        try {
+          const match = raw.match(/\[[\s\S]*\]/);
+          parsed = match ? JSON.parse(match[0]) : JSON.parse(raw);
+        } catch { parsed = [raw]; }
+        for (const briefText of parsed) {
+          if (typeof briefText === 'string' && briefText.trim()) {
+            await supabase.from('briefs').insert({
+              brand: revBrand, task_type: revTask,
+              text: briefText.trim(), segment: revSegment,
+              notes: `Revenue-derived. Target: ${revTarget} IDR. SKU: ${sku}`,
+              source: 'revenue_derived'
+            });
+          }
+        }
+      }
+      setBadge(`Generated briefs saved for ${revSkus.length} SKU(s).`);
+      setTimeout(() => setBadge(''), 5000);
+      await loadBriefs();
+    } catch(e) {
+      setGenError(e.message || 'Brief generation failed.');
+    }
+    setGenLoading(false);
+  };
+
+  const addSku = () => {
+    if (skuInput.trim() && !revSkus.includes(skuInput.trim())) {
+      setRevSkus(prev => [...prev, skuInput.trim()]);
+      setSkuInput('');
+    }
+  };
+  const removeSku = (sku) => setRevSkus(prev => prev.filter(s => s !== sku));
+
+  const vol = computeVolume();
+
+  return (
+    <div className="flex flex-col gap-6">
+      <div className="flex items-center justify-between">
+        <h2 className="text-lg font-semibold text-stone-100">Brief Bank</h2>
+        <Btn onClick={() => setShowAddForm(v => !v)} variant="amber" small>+ Add Brief</Btn>
+      </div>
+
+      {badge && <div className="fade-badge border border-amber-700 bg-amber-950 px-4 py-2 text-sm text-amber-300 mono">{badge}</div>}
+
+      {/* Add Brief Form */}
+      {showAddForm && (
+        <Card className="slide-in">
+          <p className="text-sm font-medium text-stone-200 mb-3">Add Brief Manually</p>
+          <div className="grid grid-cols-2 gap-3 mb-3">
+            <div>
+              <Lbl>Brand</Lbl>
+              <select value={newBrief.brand} onChange={e => setNewBrief(b => ({...b, brand: e.target.value}))} className="w-full bg-stone-800 border border-stone-600 text-stone-300 text-xs px-2 py-1">
+                {BRANDS.map(b => <option key={b.id} value={b.id}>{b.label}</option>)}
+              </select>
+            </div>
+            <div>
+              <Lbl>Task</Lbl>
+              <select value={newBrief.task_type} onChange={e => setNewBrief(b => ({...b, task_type: e.target.value}))} className="w-full bg-stone-800 border border-stone-600 text-stone-300 text-xs px-2 py-1">
+                {TASKS.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
+              </select>
+            </div>
+          </div>
+          <div className="mb-3">
+            <Lbl>Brief Text</Lbl>
+            <TA value={newBrief.text} onChange={v => setNewBrief(b => ({...b, text: v}))} placeholder="Specific brief: brand, task, target, angle, constraints. Max 30 words." rows={3} />
+          </div>
+          <div className="grid grid-cols-2 gap-3 mb-3">
+            <div>
+              <Lbl>Segment (optional)</Lbl>
+              <input value={newBrief.segment} onChange={e => setNewBrief(b => ({...b, segment: e.target.value}))} className="w-full bg-stone-800 border border-stone-600 text-stone-100 px-2 py-1 text-sm" placeholder="e.g. runners, moms" />
+            </div>
+            <div>
+              <Lbl>Notes (optional)</Lbl>
+              <input value={newBrief.notes} onChange={e => setNewBrief(b => ({...b, notes: e.target.value}))} className="w-full bg-stone-800 border border-stone-600 text-stone-100 px-2 py-1 text-sm" placeholder="Context or source" />
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <Btn onClick={addBrief}>Save Brief</Btn>
+            <Btn onClick={() => setShowAddForm(false)} variant="ghost">Cancel</Btn>
+          </div>
+        </Card>
+      )}
+
+      {/* Filters */}
+      <div className="flex gap-3 flex-wrap items-center">
+        <div className="flex gap-1 flex-wrap">
+          {[{id:'all',label:'All brands'}, ...BRANDS.map(b=>({id:b.id,label:b.short}))].map(b => (
+            <button key={b.id} onClick={() => setFilterBrand(b.id)} className={`px-3 py-1 text-xs border cursor-pointer transition-colors ${filterBrand===b.id ? 'border-amber-600 text-amber-400 bg-amber-950' : 'border-stone-700 text-stone-500 bg-transparent'}`}>{b.label}</button>
+          ))}
+        </div>
+        <select value={filterTask} onChange={e => setFilterTask(e.target.value)} className="bg-stone-800 border border-stone-600 text-stone-300 text-xs px-2 py-1">
+          <option value="all">All tasks</option>
+          {TASKS.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
+        </select>
+        <span className="text-xs text-stone-600 mono">{briefs.length} briefs</span>
+      </div>
+
+      {/* Brief list */}
+      {loading ? <Spinner /> : briefs.length === 0 ? (
+        <Card className="text-center py-10 text-stone-600 text-sm">No briefs yet. Add one manually or use the Revenue Calculator below.</Card>
+      ) : (
+        <div className="flex flex-col gap-3">
+          {briefs.map(brief => (
+            <Card key={brief.id} className="flex gap-3 items-start">
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 mb-1 flex-wrap">
+                  <TagBrand brand={brief.brand} />
+                  <TagTask task={brief.task_type} />
+                  {brief.source && brief.source !== 'manual' && (
+                    <span className="text-xs border border-stone-700 text-stone-500 px-2 py-0.5 mono">{brief.source}</span>
+                  )}
+                  {brief.segment && <span className="text-xs text-stone-500 mono">{brief.segment}</span>}
+                </div>
+                <p className="text-sm text-stone-200">{brief.text}</p>
+                {brief.notes && <p className="text-xs text-stone-500 mt-1">{brief.notes}</p>}
+              </div>
+              <div className="flex gap-2 flex-shrink-0">
+                <Btn onClick={() => pickBrief(brief)} variant="amber" small>Pick</Btn>
+                <Btn onClick={() => deleteBrief(brief.id)} variant="danger" small>x</Btn>
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      {/* Revenue Calculator */}
+      <div className="border border-stone-700 bg-stone-900">
+        <div className="px-4 py-3 border-b border-stone-700">
+          <p className="text-sm font-medium text-stone-100">Revenue Calculator</p>
+          <p className="text-xs text-stone-500 mt-0.5">Compute content volume needed and generate briefs automatically via AI.</p>
+        </div>
+        <div className="p-4 flex flex-col gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <div>
+              <Lbl>Revenue Target (IDR)</Lbl>
+              <input type="number" value={revTarget} onChange={e => setRevTarget(e.target.value)} className="w-full bg-stone-800 border border-stone-600 text-stone-100 px-3 py-2 text-sm" placeholder="e.g. 100000000" />
+            </div>
+            <div>
+              <Lbl>Avg Order Value (IDR)</Lbl>
+              <input type="number" value={avgOrder} onChange={e => setAvgOrder(e.target.value)} className="w-full bg-stone-800 border border-stone-600 text-stone-100 px-3 py-2 text-sm" placeholder="e.g. 130000" />
+            </div>
+            <div>
+              <Lbl>Conversion Rate (%)</Lbl>
+              <input type="number" value={convRate} onChange={e => setConvRate(e.target.value)} className="w-full bg-stone-800 border border-stone-600 text-stone-100 px-3 py-2 text-sm" placeholder="e.g. 2.5" step="0.1" />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <div>
+              <Lbl>Brand</Lbl>
+              <select value={revBrand} onChange={e => setRevBrand(e.target.value)} className="w-full bg-stone-800 border border-stone-600 text-stone-300 text-xs px-2 py-2">
+                {BRANDS.map(b => <option key={b.id} value={b.id}>{b.label}</option>)}
+              </select>
+            </div>
+            <div>
+              <Lbl>Task</Lbl>
+              <select value={revTask} onChange={e => setRevTask(e.target.value)} className="w-full bg-stone-800 border border-stone-600 text-stone-300 text-xs px-2 py-2">
+                {TASKS.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
+              </select>
+            </div>
+            <div>
+              <Lbl>Segment</Lbl>
+              <input value={revSegment} onChange={e => setRevSegment(e.target.value)} className="w-full bg-stone-800 border border-stone-600 text-stone-100 px-3 py-2 text-sm" placeholder="e.g. runners, moms" />
+            </div>
+          </div>
+
+          <div>
+            <Lbl>SKUs</Lbl>
+            <div className="flex gap-2 mb-2">
+              <input value={skuInput} onChange={e => setSkuInput(e.target.value)} onKeyDown={e => e.key === 'Enter' && addSku()} className="flex-1 bg-stone-800 border border-stone-600 text-stone-100 px-3 py-2 text-sm" placeholder="Type SKU name and press Enter or Add" />
+              <Btn onClick={addSku} variant="ghost" small>Add</Btn>
+            </div>
+            {revSkus.length > 0 && (
+              <div className="flex gap-2 flex-wrap">
+                {revSkus.map(sku => (
+                  <span key={sku} className="flex items-center gap-1 text-xs border border-stone-600 text-stone-300 px-2 py-0.5 mono">
+                    {sku}
+                    <button onClick={() => removeSku(sku)} className="text-stone-500 hover:text-red-400 cursor-pointer bg-transparent border-none ml-1">x</button>
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {vol && (
+            <div className="border border-amber-900 bg-amber-950 px-4 py-3">
+              <p className="text-xs text-amber-400 uppercase tracking-wide mb-2">Computed Volume</p>
+              <div className="flex gap-6 flex-wrap">
+                <div><p className="text-xs text-stone-500">Orders needed</p><p className="text-lg font-semibold text-amber-400 mono">{vol.orders.toLocaleString()}</p></div>
+                <div><p className="text-xs text-stone-500">Content volume needed</p><p className="text-lg font-semibold text-amber-400 mono">{vol.contentVolume.toLocaleString()}</p></div>
+                <div><p className="text-xs text-stone-500">Briefs to generate</p><p className="text-lg font-semibold text-stone-300 mono">{revSkus.length * 3}</p></div>
+              </div>
+            </div>
+          )}
+
+          {genError && <p className="text-red-400 text-sm">{genError}</p>}
+
+          <Btn onClick={generateBriefs} disabled={genLoading || !revTarget || !avgOrder || !convRate || revSkus.length === 0} className="w-full">
+            {genLoading ? 'Generating briefs...' : 'Generate Briefs via AI'}
+          </Btn>
+
+          {calcResult && (
+            <p className="text-xs text-stone-500 mono">
+              Last run: {calcResult.orders.toLocaleString()} orders needed, {calcResult.contentVolume.toLocaleString()} content pieces estimated.
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── App Root ─────────────────────────────────────────────────────────────────
+const VIEWS = [
+  { id:'generate',    label:'Generate' },
+  { id:'exemplars',   label:'Exemplars' },
+  { id:'corrections', label:'Correction Log' },
+  { id:'system',      label:'System Prompt' },
+  { id:'analytics',   label:'Analytics' },
+  { id:'reviewqueue', label:'Review Queue' },
+  { id:'briefbank',   label:'Brief Bank' },
+];
+
+function App() {
+  const [view, setView] = useState('generate');
+  const [pickedBrief, setPickedBrief] = useState(null);
+  const [currentUserId, setCurrentUserId] = useState(null);
+  const [userRole, setUserRole] = useState('anonymous');
+
+  useEffect(() => {
+    const init = async () => {
+      const uid = await getOrCreateUser();
+      setCurrentUserId(uid);
+      const role = await getUserRole(uid);
+      setUserRole(role);
+    };
+    init();
+  }, []);
+
+  return (
+    <AppContext.Provider value={{ pickedBrief, setPickedBrief, currentUserId, userRole, activeView: view, setActiveView: setView }}>
+      <div className="min-h-screen flex flex-col">
+        <header className="border-b border-stone-800 px-6 py-3 flex items-center justify-between">
+          <div><h1 className="text-base font-semibold text-amber-400 tracking-wide">PROF BEE</h1><p className="text-xs text-stone-600">Copywriting Agent</p></div>
+          <nav className="flex gap-1 flex-wrap">
+            {VIEWS.map(v => <button key={v.id} onClick={() => setView(v.id)} className={`px-4 py-2 text-xs cursor-pointer transition-colors border-b-2 bg-transparent ${view===v.id ? 'border-amber-600 text-amber-400' : 'border-transparent text-stone-500 hover:text-stone-300'}`}>{v.label}</button>)}
+          </nav>
+        </header>
+        <main className="flex-1 px-6 py-6 max-w-6xl mx-auto w-full">
+          {view==='generate'    && <GenerateView />}
+          {view==='exemplars'   && <ExemplarsView />}
+          {view==='corrections' && <CorrectionLogView />}
+          {view==='system'      && <SystemPromptView />}
+          {view==='analytics'   && <AnalyticsView />}
+          {view==='reviewqueue' && <ReviewQueueView />}
+          {view==='briefbank'   && <BriefBankView />}
+        </main>
+        <footer className="border-t border-stone-800 px-6 py-2 text-xs text-stone-700 flex items-center justify-between">
+          <span>Prof Bee Holding · Copywriting Agent v2.0</span>
+          <span className="mono">model: {CONFIG.model}</span>
+        </footer>
+      </div>
+    </AppContext.Provider>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+  </body>
+</html>
