@@ -424,7 +424,7 @@ function Spinner({ text = 'Loading...' }) {
 
 // ─── Generate View ────────────────────────────────────────────────────────────
 function GenerateView() {
-  const { currentUserId, pickedBrief, setPickedBrief, setActiveView } = useContext(AppContext);
+  const { currentUserId, pickedBrief, setPickedBrief, setActiveView, userRole } = useContext(AppContext);
   const hasKey = !!(CONFIG.apiKey() && CONFIG.apiKey() !== 'sk-YOUR-KEY-HERE');
 
   const [brand, setBrand] = useState('wnr');
@@ -631,7 +631,7 @@ function GenerateView() {
             <Lbl>Brief</Lbl>
             <TA value={brief} onChange={setBrief} placeholder="What do you need? Be specific: variant, hook angle, use case." rows={5} readOnly={briefLocked} />
             {briefLocked && <p className="text-xs text-stone-600 mt-1">Brief locked for focus session</p>}
-            <button onClick={() => setActiveView('briefbank')} className="text-xs text-amber-600 hover:text-amber-400 cursor-pointer mt-2 bg-transparent border-none">Browse Brief Bank</button>
+            {userRole === 'owner' && (<button onClick={() => setActiveView('briefbank')} className="text-xs text-amber-600 hover:text-amber-400 cursor-pointer mt-2 bg-transparent border-none">Browse Brief Bank</button>)}
           </Card>
 
           {/* Focus Mode */}
@@ -1796,21 +1796,25 @@ function BriefBankView() {
 }
 
 // ─── App Root ─────────────────────────────────────────────────────────────────
-const VIEWS = [
-  { id:'generate',    label:'Generate' },
-  { id:'exemplars',   label:'Exemplars' },
-  { id:'corrections', label:'Correction Log' },
-  { id:'system',      label:'System Prompt' },
-  { id:'analytics',   label:'Analytics' },
-  { id:'reviewqueue', label:'Review Queue' },
-  { id:'briefbank',   label:'Brief Bank' },
-];
-
 function App() {
   const [view, setView] = useState('generate');
   const [pickedBrief, setPickedBrief] = useState(null);
   const [currentUserId, setCurrentUserId] = useState(null);
   const [userRole, setUserRole] = useState('anonymous');
+
+  const VIEWS = userRole === 'owner'
+    ? [
+        { id:'generate',    label:'Generate' },
+        { id:'exemplars',   label:'Exemplars' },
+        { id:'corrections', label:'Correction Log' },
+        { id:'system',      label:'System Prompt' },
+        { id:'analytics',   label:'Analytics' },
+        { id:'reviewqueue', label:'Review Queue' },
+        { id:'briefbank',   label:'Brief Bank' },
+      ]
+    : [
+        { id:'generate', label:'Generate' },
+      ];
 
   useEffect(() => {
     const init = async () => {
@@ -1826,7 +1830,7 @@ function App() {
     <AppContext.Provider value={{ pickedBrief, setPickedBrief, currentUserId, userRole, activeView: view, setActiveView: setView }}>
       <div className="min-h-screen flex flex-col">
         <header className="border-b border-stone-800 px-6 py-3 flex items-center justify-between">
-          <div><h1 className="text-base font-semibold text-amber-400 tracking-wide">PROF BEE</h1><p className="text-xs text-stone-600">Copywriting Agent</p></div>
+          <div className="flex items-center gap-2"><h1 className="text-base font-semibold text-amber-400 tracking-wide">PROF BEE</h1><p className="text-xs text-stone-600">Copywriting Agent</p>{userRole === 'owner' && (<span className="text-xs border border-amber-700 text-amber-500 px-2 py-0.5 mono ml-2">admin</span>)}</div>
           <nav className="flex gap-1 flex-wrap">
             {VIEWS.map(v => <button key={v.id} onClick={() => setView(v.id)} className={`px-4 py-2 text-xs cursor-pointer transition-colors border-b-2 bg-transparent ${view===v.id ? 'border-amber-600 text-amber-400' : 'border-transparent text-stone-500 hover:text-stone-300'}`}>{v.label}</button>)}
           </nav>
@@ -1842,7 +1846,7 @@ function App() {
         </main>
         <footer className="border-t border-stone-800 px-6 py-2 text-xs text-stone-700 flex items-center justify-between">
           <span>Prof Bee Holding · Copywriting Agent v2.0</span>
-          <span className="mono">model: {CONFIG.model}</span>
+          <span className="mono">model: {CONFIG.model} · role: {userRole}</span>
         </footer>
       </div>
     </AppContext.Provider>
