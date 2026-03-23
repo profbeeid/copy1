@@ -536,7 +536,7 @@ function GenerateView() {
   const saveExemplar = async () => {
     if (!output) return;
     const overall = computeOverall(dimensionScores);
-    await supabase.from('exemplars').insert({
+    const { error } = await supabase.from('exemplars').insert({
       generation_id: currentGenerationId,
       brand: output.brand, task_type: output.task,
       brief: output.brief, output: output.text,
@@ -548,6 +548,7 @@ function GenerateView() {
       score_originality: dimensionScores.originality,
       notes: exNotes
     });
+    if (error) { setError('Exemplar save failed: ' + error.message); return; }
     setBadge('Exemplar saved.'); setShowExForm(false); setExNotes('');
     setTimeout(() => setBadge(''), 3000);
   };
@@ -556,7 +557,7 @@ function GenerateView() {
     if (!output) return;
     const overall = computeOverall(dimensionScores);
     const worst = computeWorstDimension(dimensionScores);
-    await supabase.from('anti_exemplars').insert({
+    const { error } = await supabase.from('anti_exemplars').insert({
       generation_id: currentGenerationId,
       brand: output.brand, task_type: output.task,
       brief: output.brief, output: output.text,
@@ -569,6 +570,7 @@ function GenerateView() {
       score_originality: dimensionScores.originality,
       why_bad: antiExWhyBad
     });
+    if (error) { setError('Anti-exemplar save failed: ' + error.message); return; }
     setBadge('Anti-exemplar saved. The model will avoid this pattern.');
     setShowAntiExForm(false); setAntiExWhyBad('');
     setTimeout(() => setBadge(''), 4000);
